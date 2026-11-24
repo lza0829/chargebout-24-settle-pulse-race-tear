@@ -1,6 +1,5 @@
 from __future__ import annotations
 from datetime import datetime, timedelta
-from app.services import settle_surface
 
 from app.db import db, row_dict, rows
 
@@ -199,10 +198,4 @@ def list_journal(conn, session_id: int):
             (session_id,),
         ).fetchall()
     )
-
-_overview_impl = overview
-
-
-def overview(conn):
-    return settle_surface.overlay_overview(_overview_impl(conn), conn)
 

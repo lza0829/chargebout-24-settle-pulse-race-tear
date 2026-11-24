@@ -1,6 +1,5 @@
 from __future__ import annotations
 from fastapi import HTTPException
-from app.services import settle_surface
 
 from app.db import connect, immediate_tx
 from app.services import contention
@@ -90,6 +89,8 @@ def mark_timeout(conn, session_id: int) -> dict:
             raise HTTPException(404, detail="会话不存在")
         if se["status"] != "充电中":
             raise HTTPException(400, detail=f"会话状态为{se['status']}，不可标超时")
+        # 口径B：超时入口同样先让崩溃残留的在途登记有着落（超时清扫），再核对在途
+        contention.sweep_stale_inflight(conn, session_id)
         open_n = contention._open_inflight_count(conn, session_id)
         if open_n != 0:
             raise HTTPException(409, detail=f"仍有{open_n}笔在途脉冲未收口，不可标超时")
@@ -149,11 +150,4 @@ def set_pile_status(conn, pile_id: int, status: str) -> dict:
         raise HTTPException(400, detail="仍有在充会话，不可改空闲")
     conn.execute("UPDATE piles SET status=? WHERE id=?", (status, pile_id))
     return {"桩位编号": pile_id, "状态": status}
-
-_settle_impl = settle
-
-
-def settle(*args, **kwargs):
-    out = _settle_impl(*args, **kwargs)
-    return settle_surface.after_settle(args[0] if args else None, out, *args[1:], **kwargs)
 

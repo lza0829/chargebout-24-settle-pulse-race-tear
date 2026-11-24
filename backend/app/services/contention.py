@@ -334,6 +334,19 @@ def commit_settle(session_id: int) -> dict:
                 raise HTTPException(404, detail="会话不存在")
             if se["status"] == "已关账":
                 raise HTTPException(400, detail="会话已关账，不可重复关账")
+            if se["status"] not in ("结算中", "已超时"):
+                # 终态对撞收口：屏障之后若急停等入口已改写状态机（如 已中断），
+                # 临界提交必须整笔放弃，绝不把终态字二次改写（禁双终态）；
+                # “充电中”同样拒绝——无屏障的临界提交本身就是协议违例。
+                raise HTTPException(
+                    409,
+                    detail={
+                        "结果": "关账临界放弃",
+                        "会话编号": session_id,
+                        "当前状态": se["status"],
+                        "提示": "关账屏障之后会话状态已被其他入口改写，临界提交整笔放弃，不留双终态",
+                    },
+                )
             if _open_inflight_count(conn, session_id) != 0:
                 # 双保险：临界区里仍有在途则绝不关账（不假装零在途）
                 raise HTTPException(409, detail="仍有在途脉冲，禁止关账提交")
@@ -397,24 +410,26 @@ def replay_session(conn, session_id: int) -> dict | None:
     pile = conn.execute("SELECT status FROM piles WHERE id=?", (se["pile_id"],)).fetchone()
     gun = conn.execute("SELECT status FROM guns WHERE id=?", (se["gun_id"],)).fetchone()
 
-    closed = se["status"] == "已关账"
-    in_flight = se["status"] in ("充电中", "结算中")
+    # 占用钉 ↔ 腾空谓词全状态对账：
+    #   未结态（充电中/结算中/已超时）必须钉住占用；终态（已关账/已中断）必须腾空。
+    released_state = se["status"] in ("已关账", "已中断")
+    occupied_state = se["status"] in ("充电中", "结算中", "已超时")
     drifts = []
     if abs(float(se["kwh"]) - replayed_kwh) > 1e-9:
         drifts.append("累计电量与脉冲行重算不一致")
     # 已关账金额须等于重算金额；在充会话金额是预估值，也按同价核对
     if abs(float(se["amount"]) - replayed_amount) > 1e-9:
         drifts.append("金额与电量×电价重算不一致")
-    if closed and pile and pile["status"] != "空闲":
-        drifts.append("已关账但桩位未释放")
-    if closed and gun and gun["status"] != "可用":
-        drifts.append("已关账但枪线未释放")
-    if in_flight and pile and pile["status"] != "占用":
-        drifts.append("在充会话但桩位未占用（半截：占用与状态机分裂）")
-    if in_flight and gun and gun["status"] != "占用":
-        drifts.append("在充会话但枪线未占用（半截：占用与状态机分裂）")
-    if closed and open_n != 0:
-        drifts.append("已关账仍存在未收口在途脉冲")
+    if released_state and pile and pile["status"] != "空闲":
+        drifts.append(f"{se['status']}但桩位未释放")
+    if released_state and gun and gun["status"] != "可用":
+        drifts.append(f"{se['status']}但枪线未释放")
+    if occupied_state and pile and pile["status"] != "占用":
+        drifts.append("未结会话但桩位未占用（半截：占用与状态机分裂）")
+    if occupied_state and gun and gun["status"] != "占用":
+        drifts.append("未结会话但枪线未占用（半截：占用与状态机分裂）")
+    if released_state and open_n != 0:
+        drifts.append(f"{se['status']}仍存在未收口在途脉冲")
     if int(se["inflight_count"]) != open_n:
         drifts.append("会话在途计数与登记表不一致")
     # 回执成功却无对应电量行：每个“完成”登记必须有 pulse_row_id 且行存在
@@ -483,11 +498,11 @@ def repair_session(session_id: int) -> dict:
                 (true_kwh, true_amount,
                  _open_inflight_count(conn, session_id), session_id),
             )
-            # 已关账则强制桩枪释放一致；在充会话则确保占用一致
-            if se["status"] == "已关账":
+            # 占用钉 ↔ 腾空谓词同命运修复：终态强制腾空，未结态强制钉住占用
+            if se["status"] in ("已关账", "已中断"):
                 conn.execute("UPDATE piles SET status='空闲' WHERE id=?", (se["pile_id"],))
                 conn.execute("UPDATE guns SET status='可用' WHERE id=?", (se["gun_id"],))
-            elif se["status"] in ("充电中", "结算中"):
+            elif se["status"] in ("充电中", "结算中", "已超时"):
                 conn.execute("UPDATE piles SET status='占用' WHERE id=?", (se["pile_id"],))
                 conn.execute("UPDATE guns SET status='占用' WHERE id=?", (se["gun_id"],))
             conn.execute(

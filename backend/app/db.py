@@ -198,12 +198,19 @@ def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """对既有库做幂等加列迁移（老库没有争用世代字段时补齐）。"""
+    """对既有库做幂等加列迁移（老库没有争用世代字段时补齐）。
+
+    同时收口“假关账”旁路残留：surface_last/surface_ok 涂改总览的假绿键、
+    settle_surface:* 旁路关账字一律清除——真值只认 sessions 状态机与 pulses 行，
+    旁路键不删则旧库重启后仍可能读到涂改面。
+    """
     cols = _column_names(conn, "sessions")
     if "settle_generation" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN settle_generation INTEGER NOT NULL DEFAULT 0")
     if "inflight_count" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN inflight_count INTEGER NOT NULL DEFAULT 0")
+    conn.execute("DELETE FROM settings WHERE key IN ('surface_last', 'surface_ok')")
+    conn.execute("DELETE FROM settings WHERE key LIKE 'settle_surface:%'")
 
 
 def init_db() -> None:

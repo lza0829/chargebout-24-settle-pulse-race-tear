@@ -338,5 +338,213 @@ class TestConcurrentStress(ContentionTestBase):
             self.assertEqual(self.get(sid)[0]["kwh"], se["kwh"])
 
 
+class TestSettleReceiptTruth(ContentionTestBase):
+    """夹具：关账绿仍进脉冲——回执、状态机、腾空、总览、审计必须同刷同命运。"""
+
+    def test_green_receipt_means_closed_everywhere(self):
+        sid = self.open_one()
+        svc.add_pulse(sid, 2.0)
+        receipt = svc.settle(sid)  # 走 HTTP 入口同款 svc.settle
+        self.assertEqual(receipt["结果"], "已关账")
+
+        # 回执绿 ⇒ 会话已关态、桩枪已腾空（同命运）
+        se, pile_status, gun_status = self.get(sid)
+        self.assertEqual(se["status"], "已关账")
+        self.assertEqual(pile_status, "空闲")
+        self.assertEqual(gun_status, "可用")
+
+        # 关后脉冲一律拒写，电量金额冻结
+        with self.assertRaises(HTTPException) as cm:
+            svc.add_pulse(sid, 1.0)
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(self.get(sid)[0]["kwh"], 2.0)
+        self.assertEqual(self.pulse_count(sid), 1)
+
+        # 总览如实：无涂改层、无旁路假绿键
+        with db() as conn:
+            ov = core.overview(conn)
+            self.assertEqual(ov["已关账"], 1)
+            self.assertEqual(ov["充电中"], 0)
+            self.assertEqual(ov["桩位占用"], 0)
+            self.assertNotIn("surface_ok", ov)
+            keys = {r["key"] for r in conn.execute("SELECT key FROM settings").fetchall()}
+        self.assertFalse(any(k.startswith("surface") for k in keys), keys)
+        self.assertFalse(any(k.startswith("settle_surface") for k in keys), keys)
+
+        # 审计可重放：事件流只有一套终态，重放一致
+        with db() as conn:
+            rep = contention.replay_session(conn, sid)
+            actions = [r["action"] for r in conn.execute(
+                "SELECT action FROM session_events WHERE session_id=? ORDER BY id", (sid,)
+            ).fetchall()]
+        self.assertTrue(rep["一致"], rep["偏差"])
+        self.assertEqual(actions.count("结算关账"), 1)
+        self.assertNotIn("异常中断", actions)
+
+
+class TestAbortSettleRace(ContentionTestBase):
+    """夹具：急停关账交错双终态——两个时序都必须收敛到单一终态。"""
+
+    def test_abort_wins_then_late_commit_abandoned(self):
+        sid = self.open_one()
+        svc.add_pulse(sid, 2.0)
+        contention.begin_settle_barrier(sid)  # 关账屏障已立（结算中）
+        with db() as conn:
+            r = svc.abort_session(conn, sid, "急停")  # 急停抢先收口
+        self.assertEqual(r["状态"], "已中断")
+
+        # 迟到的关账临界提交必须整笔放弃，不得把 已中断 改写成 已关账
+        with self.assertRaises(HTTPException) as cm:
+            contention.commit_settle(sid)
+        self.assertEqual(cm.exception.status_code, 409)
+
+        se, pile_status, gun_status = self.get(sid)
+        self.assertEqual(se["status"], "已中断", "急停结局不得被关账临界覆盖")
+        self.assertEqual(pile_status, "空闲")
+        self.assertEqual(gun_status, "可用")
+        with db() as conn:
+            actions = [r["action"] for r in conn.execute(
+                "SELECT action FROM session_events WHERE session_id=? ORDER BY id", (sid,)
+            ).fetchall()]
+            rep = contention.replay_session(conn, sid)
+        self.assertEqual(actions.count("异常中断"), 1)
+        self.assertNotIn("结算关账", actions, "禁止双终态事件同挂")
+        self.assertTrue(rep["一致"], rep["偏差"])
+
+    def test_settle_wins_then_abort_rejected(self):
+        sid = self.open_one()
+        svc.add_pulse(sid, 1.0)
+        receipt = svc.settle(sid)
+        self.assertEqual(receipt["结果"], "已关账")
+        with db() as conn:
+            with self.assertRaises(HTTPException):
+                svc.abort_session(conn, sid, "急停")
+        se, pile_status, gun_status = self.get(sid)
+        self.assertEqual(se["status"], "已关账")
+        self.assertEqual(pile_status, "空闲")
+        self.assertEqual(gun_status, "可用")
+
+
+class TestTimeoutSettleRace(ContentionTestBase):
+    """夹具：超时关账双终态——超时与关账交错只允许一套终态字。"""
+
+    def test_timeout_then_settle_single_final(self):
+        sid = self.open_one()
+        svc.add_pulse(sid, 1.5)
+        with db() as conn:
+            r = svc.mark_timeout(conn, sid)
+        self.assertEqual(r["状态"], "已超时")
+        # 已超时会话仍可关账收口：终态字只有 已关账 一套
+        receipt = svc.settle(sid)
+        self.assertEqual(receipt["结果"], "已关账")
+        se, pile_status, gun_status = self.get(sid)
+        self.assertEqual(se["status"], "已关账")
+        self.assertEqual(pile_status, "空闲")
+        self.assertEqual(gun_status, "可用")
+        with db() as conn:
+            rep = contention.replay_session(conn, sid)
+        self.assertTrue(rep["一致"], rep["偏差"])
+
+    def test_barrier_then_timeout_rejected(self):
+        sid = self.open_one()
+        contention.begin_settle_barrier(sid)  # 结算中
+        with db() as conn:
+            with self.assertRaises(HTTPException) as cm:
+                svc.mark_timeout(conn, sid)
+        self.assertEqual(cm.exception.status_code, 400)
+        receipt = svc.settle(sid)  # 关账不受干扰，单套终态
+        self.assertEqual(receipt["结果"], "已关账")
+        self.assertEqual(self.get(sid)[0]["status"], "已关账")
+
+
+class TestOpenThenImmediateContention(ContentionTestBase):
+    """夹具：开充入口新建会话后立即关账×脉冲对撞，结局仍须线性一致。"""
+
+    def test_fresh_session_pulse_vs_settle(self):
+        sid = self.open_one()  # 新建会话立即进入对撞
+        token = contention.register_inflight(sid, 3.0, 7.0)
+        outcomes: dict = {}
+
+        def settle():
+            try:
+                outcomes["settle"] = contention.settle(sid)
+            except HTTPException as e:
+                outcomes["settle_err"] = e
+
+        t = threading.Thread(target=settle)
+        t.start()
+        fin = contention._finalize_inflight(token, sid, 3.0, 7.0)
+        t.join()
+        self.assertEqual(fin["结果"], "入账", "屏障前登记的在途必须落账")
+        self.assertIn("settle", outcomes)
+        self.assertAlmostEqual(outcomes["settle"]["电量"], 3.0, places=3)
+        se, pile_status, gun_status = self.get(sid)
+        self.assertEqual(se["status"], "已关账")
+        self.assertEqual((pile_status, gun_status), ("空闲", "可用"))
+        with db() as conn:
+            self.assertTrue(contention.replay_session(conn, sid)["一致"])
+
+
+class TestTerminalOccupancyReconcile(ContentionTestBase):
+    """占用钉 ↔ 腾空谓词全状态对账：已中断/已超时 的半截也能被重放识别并修复。"""
+
+    def test_aborted_but_pile_occupied_gets_repaired(self):
+        sid = self.open_one()
+        with db() as conn:
+            svc.abort_session(conn, sid, "急停")
+        with db() as conn:  # 制造半截：已中断但桩位仍占用
+            se = conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+            conn.execute("UPDATE piles SET status='占用' WHERE id=?", (se["pile_id"],))
+            conn.execute("UPDATE guns SET status='占用' WHERE id=?", (se["gun_id"],))
+        with db() as conn:
+            rep = contention.replay_session(conn, sid)
+        self.assertFalse(rep["一致"])
+        fixed = contention.repair_session(sid)
+        self.assertTrue(fixed["修复后"]["一致"])
+        _, pile_status, gun_status = self.get(sid)
+        self.assertEqual((pile_status, gun_status), ("空闲", "可用"))
+
+    def test_timeout_but_pile_released_gets_repaired(self):
+        sid = self.open_one()
+        with db() as conn:
+            svc.mark_timeout(conn, sid)
+        with db() as conn:  # 制造半截：已超时（未结）但桩枪被腾空
+            se = conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+            conn.execute("UPDATE piles SET status='空闲' WHERE id=?", (se["pile_id"],))
+            conn.execute("UPDATE guns SET status='可用' WHERE id=?", (se["gun_id"],))
+        with db() as conn:
+            rep = contention.replay_session(conn, sid)
+        self.assertFalse(rep["一致"], "已超时未结会话必须钉住占用")
+        fixed = contention.repair_session(sid)
+        self.assertTrue(fixed["修复后"]["一致"])
+        _, pile_status, gun_status = self.get(sid)
+        self.assertEqual((pile_status, gun_status), ("占用", "占用"))
+
+
+class TestBypassResidueConverged(ContentionTestBase):
+    """假关账收口：既有库里的旁路涂改键在启动迁移时被清除。"""
+
+    def test_migrate_purges_surface_keys(self):
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO settings(key,value) VALUES('surface_last','{}') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+            conn.execute(
+                "INSERT INTO settings(key,value) VALUES('surface_ok','1') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+            conn.execute(
+                "INSERT INTO settings(key,value) VALUES('settle_surface:1','{}') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+            from app.db import migrate
+            migrate(conn)
+            keys = {r["key"] for r in conn.execute("SELECT key FROM settings").fetchall()}
+        self.assertNotIn("surface_last", keys)
+        self.assertNotIn("surface_ok", keys)
+        self.assertNotIn("settle_surface:1", keys)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
